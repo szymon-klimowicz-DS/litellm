@@ -94,9 +94,6 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
             kwargs["event_hook"] = GuardrailEventHooks.logging_only
         super().__init__(**kwargs)
         self.guardrail_provider = "presidio"
-        self.pii_tokens: dict = (
-            {}
-        )  # mapping of PII token to original text - only used with Presidio `replace` operation
         self.mock_redacted_text = mock_redacted_text
         self.output_parse_pii = output_parse_pii or False
         self.apply_to_output = apply_to_output
