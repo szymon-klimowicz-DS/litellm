@@ -295,7 +295,7 @@ async def test_output_parsing():
         user_api_key_dict=UserAPIKeyAuth(),
         data={
             "messages": [{"role": "system", "content": "You are an helpfull assistant"}],
-            "pii_tokens": {"<PERSON>": "Jane Doe", "<PHONE_NUMBER>": "034453334"},
+            "metadata": {"hidden_params": {"pii_tokens": {"<PERSON>": "Jane Doe", "<PHONE_NUMBER>": "034453334"}}},
         },
         response=response,
     )

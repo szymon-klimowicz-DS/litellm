@@ -469,50 +469,42 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
                     redacted_text = await response.json()
 
-            new_text = text
-            if redacted_text is not None:
-                verbose_proxy_logger.debug("redacted_text: %s", redacted_text)
-                for item in redacted_text["items"]:
-                    start = item["start"]
-                    end = item["end"]
-                    replacement = item["text"]  # replacement token
-                    if item["operator"] == "replace" and output_parse_pii is True:
-                        # check if token in dict
-                        # if exists, add a uuid to the replacement token for swapping back to the original text in llm response output parsing
-                        if request_data is None:
-                            verbose_proxy_logger.warning(
-                                "Presidio anonymize_text called without request_data — "
-                                "PII tokens cannot be stored per-request. "
-                                "This may indicate a missing caller update."
-                            )
-                            request_data = {}
-                        if "pii_tokens" not in request_data:
-                            request_data["pii_tokens"] = {}
-                        pii_tokens = request_data["pii_tokens"]
-
-                        # Always append a UUID to ensure the replacement token is unique to this request and session.
-                        # This prevents collisions where the LLM might hallucinate a generic token like [PHONE_NUMBER].
-                        replacement = f"{replacement}_{str(uuid.uuid4())[:12]}"
-
-                        pii_tokens[replacement] = new_text[
-                            start:end
-                        ]  # get text it'll replace
-
-                    new_text = new_text[:start] + replacement + new_text[end:]
-                    entity_type = item.get("entity_type", None)
-                    if entity_type is not None:
-                        masked_entity_count[entity_type] = (
-                            masked_entity_count.get(entity_type, 0) + 1
-                        )
-                # When output_parse_pii is True, new_text contains UUID-suffixed
-                # tokens that match the keys in pii_tokens.  Returning
-                # redacted_text["text"] (Presidio's original output) would send
-                # un-suffixed tokens to the LLM, making unmasking impossible.
-                # When output_parse_pii is False, new_text == redacted_text["text"]
-                # because no UUID suffix is appended.
-                return new_text
-            else:
+            if redacted_text is None:
                 raise Exception("Invalid anonymizer response: received None")
+
+            verbose_proxy_logger.debug("redacted_text: %s", redacted_text)
+
+            for item in redacted_text["items"]:
+                entity_type = item.get("entity_type")
+                if entity_type is not None:
+                    masked_entity_count[entity_type] = (
+                        masked_entity_count.get(entity_type, 0) + 1
+                    )
+
+            if not output_parse_pii:
+                return redacted_text["text"]
+
+            # Map each entity type to its original text positions (from the
+            # analyzer, which uses positions in the *original* input text).
+            original_positions = self._group_analyzer_positions(analyze_results)
+
+            if request_data is None:
+                request_data = {}
+            metadata = request_data.setdefault("metadata", {})
+            hidden_params = metadata.setdefault("hidden_params", {})
+            pii_tokens = hidden_params.setdefault("pii_tokens", {})
+
+            # Rebuild the anonymized text, replacing each plain token (e.g.
+            # "<PERSON>") with a UUID-suffixed version and recording the
+            # original PII value it maps to.
+            anon_items = sorted(redacted_text["items"], key=lambda x: x.get("start", 0))
+            return self._build_tokenized_output(
+                anonymized_text=redacted_text["text"],
+                anon_items=anon_items,
+                original_text=text,
+                original_positions=original_positions,
+                pii_tokens=pii_tokens,
+            )
         except Exception as e:
             # Sanitize exception to avoid leaking the original text (which may
             # contain API keys or other secrets) in error responses.
@@ -525,6 +517,68 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
             raise Exception(
                 f"Presidio PII anonymization failed: {type(e).__name__}"
             ) from e
+
+    @staticmethod
+    def _group_analyzer_positions(
+        analyze_results: Any,
+    ) -> Dict[str, List[Tuple[int, int]]]:
+        """
+        Group analyzer results by entity_type → sorted list of (start, end)
+        positions in the original text.
+        """
+        by_type: Dict[str, List[Tuple[int, int]]] = {}
+        for analyze_result in analyze_results:
+            if not isinstance(analyze_result, dict):
+                continue
+            entity_type = analyze_result.get("entity_type", "")
+            by_type.setdefault(entity_type, []).append(
+                (analyze_result.get("start", 0), analyze_result.get("end", 0))
+            )
+        for positions in by_type.values():
+            positions.sort()
+        return by_type
+
+    @staticmethod
+    def _build_tokenized_output(
+        anonymized_text: str,
+        anon_items: List[dict],
+        original_text: str,
+        original_positions: Dict[str, List[Tuple[int, int]]],
+        pii_tokens: dict,
+    ) -> str:
+        """
+        Replace each plain anonymizer token in the anonymized text with a
+        UUID-suffixed version, and record the mapping to the original PII value.
+        """
+        parts: List[str] = []
+        last_end = 0
+
+        for item in anon_items:
+            if item.get("operator") != "replace":
+                continue
+
+            entity_type = item.get("entity_type", "")
+            positions = original_positions.get(entity_type)
+            if not positions:
+                verbose_proxy_logger.warning(
+                    "Presidio anonymizer returned entity_type '%s' with no "
+                    "matching analyzer result — skipping token mapping",
+                    entity_type,
+                )
+                continue
+
+            orig_start, orig_end = positions.pop(0)
+            original_pii = original_text[orig_start:orig_end]
+
+            unique_token = f"{item['text']}_{str(uuid.uuid4())[:12]}"
+            pii_tokens[unique_token] = original_pii
+
+            parts.append(anonymized_text[last_end : item["start"]])
+            parts.append(unique_token)
+            last_end = item["end"]
+
+        parts.append(anonymized_text[last_end:])
+        return "".join(parts)
 
     def filter_analyze_results_by_score(
         self, analyze_results: Union[List[PresidioAnalyzeResponseItem], Dict]
@@ -541,8 +595,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         filtered_results: List[PresidioAnalyzeResponseItem] = []
         deny_list_strings = [
-            getattr(x, "value", str(x))
-            for x in self.presidio_entities_deny_list
+            getattr(x, "value", str(x)) for x in self.presidio_entities_deny_list
         ]
         for item in analyze_results:
             entity_type = item.get("entity_type")
@@ -919,9 +972,9 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                 min_overlap = min(20, len(token) // 2)
                 for i in range(max(0, len(text) - len(token)), len(text)):
                     sub = text[i:]
-                    if token.startswith(sub) and len(sub) >= min_overlap:
-                        text = text[:i] + original_text
-                        break
+                if token.startswith(sub) and len(sub) >= min_overlap:
+                    text = text[:i] + original_text
+                    break
         return text
 
     async def _process_response_for_pii(
@@ -934,10 +987,12 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         Helper to recursively process a ModelResponse for PII.
         Handles all choices and tool calls.
         """
-        pii_tokens = request_data.get("pii_tokens", {}) if request_data else {}
+        metadata = request_data.get("metadata", {}) if request_data else {}
+        hidden_params = metadata.get("hidden_params", {})
+        pii_tokens = hidden_params.get("pii_tokens", {})
         if not pii_tokens and mode == "unmask":
             verbose_proxy_logger.debug(
-                "No pii_tokens found in request_data — nothing to unmask"
+                "No pii_tokens found in request_data.metadata.hidden_params — nothing to unmask"
             )
         presidio_config = self.get_presidio_settings_from_request_data(
             request_data or {}
@@ -1096,10 +1151,12 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                 return
 
         # --- PII unmasking path (output_parse_pii=True) ---
-        pii_tokens = request_data.get("pii_tokens", {}) if request_data else {}
+        metadata = request_data.get("metadata", {}) if request_data else {}
+        hidden_params = metadata.get("hidden_params", {})
+        pii_tokens = hidden_params.get("pii_tokens", {})
         if not pii_tokens and request_data:
             verbose_proxy_logger.debug(
-                "No pii_tokens in request_data for streaming unmask path"
+                "No pii_tokens in request_data.metadata.hidden_params for streaming unmask path"
             )
         if not (self.output_parse_pii and pii_tokens):
             async for chunk in response:

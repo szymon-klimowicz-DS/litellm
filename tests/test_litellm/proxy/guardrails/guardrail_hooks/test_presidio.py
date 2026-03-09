@@ -15,11 +15,11 @@ sys.path.insert(0, os.path.abspath("../../../../../.."))
 
 import litellm
 from litellm.caching.caching import DualCache
+from litellm.exceptions import GuardrailRaisedException
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.presidio import (
     _OPTIONAL_PresidioPIIMasking,
 )
-from litellm.exceptions import GuardrailRaisedException
 from litellm.types.guardrails import LitellmParams, PiiAction, PiiEntityType
 from litellm.types.utils import Choices, Message, ModelResponse
 
@@ -1608,3 +1608,210 @@ async def test_anonymize_text_http_error_status():
                 output_parse_pii=False,
                 masked_entity_count={},
             )
+
+
+@pytest.mark.asyncio
+async def test_anonymize_text_output_parse_pii_stores_correct_values():
+    """pii_tokens should map UUID-suffixed tokens to the correct original PII values."""
+    guardrail = _OPTIONAL_PresidioPIIMasking(
+        presidio_analyzer_api_base="http://test-analyzer/",
+        presidio_anonymizer_api_base="http://test-anonymizer/",
+        mock_testing=False,
+    )
+    original_text = "Mike called Jane at jane@test.com"
+    analyze_results = [
+        {"start": 0, "end": 4, "entity_type": "PERSON", "score": 0.85},
+        {"start": 12, "end": 16, "entity_type": "PERSON", "score": 0.85},
+        {"start": 20, "end": 33, "entity_type": "EMAIL_ADDRESS", "score": 0.95},
+    ]
+    anonymizer_response = {
+        "text": "<PERSON> called <PERSON> at <EMAIL_ADDRESS>",
+        "items": [
+            {
+                "start": 0,
+                "end": 8,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 16,
+                "end": 24,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 28,
+                "end": 43,
+                "entity_type": "EMAIL_ADDRESS",
+                "text": "<EMAIL_ADDRESS>",
+                "operator": "replace",
+            },
+        ],
+    }
+    mock_iterator = _make_mock_session_iterator(json_response=anonymizer_response)
+    request_data: dict = {}
+
+    with patch.object(guardrail, "_get_session_iterator", mock_iterator):
+        result = await guardrail.anonymize_text(
+            text=original_text,
+            analyze_results=analyze_results,
+            output_parse_pii=True,
+            masked_entity_count={},
+            request_data=request_data,
+        )
+
+    pii_tokens = request_data["metadata"]["hidden_params"]["pii_tokens"]
+    assert len(pii_tokens) == 3
+    assert set(pii_tokens.values()) == {"Mike", "Jane", "jane@test.com"}
+
+    for token, value in pii_tokens.items():
+        assert token in result
+        if value in ("Mike", "Jane"):
+            assert token.startswith("<PERSON>_")
+        else:
+            assert token.startswith("<EMAIL_ADDRESS>_")
+
+
+@pytest.mark.asyncio
+async def test_anonymize_text_output_parse_pii_false():
+    """With output_parse_pii=False, return Presidio's text verbatim."""
+    guardrail = _OPTIONAL_PresidioPIIMasking(
+        presidio_analyzer_api_base="http://test-analyzer/",
+        presidio_anonymizer_api_base="http://test-anonymizer/",
+        mock_testing=False,
+    )
+    original_text = "my name is Mike"
+    analyze_results = [
+        {"start": 11, "end": 15, "entity_type": "PERSON", "score": 0.85},
+    ]
+    anonymizer_response = {
+        "text": "my name is <PERSON>",
+        "items": [
+            {
+                "start": 11,
+                "end": 19,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+        ],
+    }
+    mock_iterator = _make_mock_session_iterator(json_response=anonymizer_response)
+
+    with patch.object(guardrail, "_get_session_iterator", mock_iterator):
+        result = await guardrail.anonymize_text(
+            text=original_text,
+            analyze_results=analyze_results,
+            output_parse_pii=False,
+            masked_entity_count={},
+        )
+
+    assert result == "my name is <PERSON>"
+
+
+@pytest.mark.asyncio
+async def test_anonymize_text_entity_counts():
+    """masked_entity_count should reflect all detected entities."""
+    guardrail = _OPTIONAL_PresidioPIIMasking(
+        presidio_analyzer_api_base="http://test-analyzer/",
+        presidio_anonymizer_api_base="http://test-anonymizer/",
+        mock_testing=False,
+    )
+    original_text = "Mike called Jane yesterday"
+    analyze_results = [
+        {"start": 0, "end": 4, "entity_type": "PERSON", "score": 0.85},
+        {"start": 12, "end": 16, "entity_type": "PERSON", "score": 0.85},
+    ]
+    anonymizer_response = {
+        "text": "<PERSON> called <PERSON> yesterday",
+        "items": [
+            {
+                "start": 0,
+                "end": 8,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 16,
+                "end": 24,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+        ],
+    }
+    mock_iterator = _make_mock_session_iterator(json_response=anonymizer_response)
+    masked_entity_count: dict = {}
+
+    with patch.object(guardrail, "_get_session_iterator", mock_iterator):
+        await guardrail.anonymize_text(
+            text=original_text,
+            analyze_results=analyze_results,
+            output_parse_pii=False,
+            masked_entity_count=masked_entity_count,
+        )
+
+    assert masked_entity_count == {"PERSON": 2}
+
+
+@pytest.mark.asyncio
+async def test_unmask_roundtrip():
+    """Anonymize then unmask should recover the original PII values."""
+    guardrail = _OPTIONAL_PresidioPIIMasking(
+        presidio_analyzer_api_base="http://test-analyzer/",
+        presidio_anonymizer_api_base="http://test-anonymizer/",
+        mock_testing=False,
+    )
+    original_text = "Mike called Jane at jane@test.com"
+    analyze_results = [
+        {"start": 0, "end": 4, "entity_type": "PERSON", "score": 0.85},
+        {"start": 12, "end": 16, "entity_type": "PERSON", "score": 0.85},
+        {"start": 20, "end": 33, "entity_type": "EMAIL_ADDRESS", "score": 0.95},
+    ]
+    anonymizer_response = {
+        "text": "<PERSON> called <PERSON> at <EMAIL_ADDRESS>",
+        "items": [
+            {
+                "start": 0,
+                "end": 8,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 16,
+                "end": 24,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 28,
+                "end": 43,
+                "entity_type": "EMAIL_ADDRESS",
+                "text": "<EMAIL_ADDRESS>",
+                "operator": "replace",
+            },
+        ],
+    }
+    mock_iterator = _make_mock_session_iterator(json_response=anonymizer_response)
+    request_data: dict = {}
+
+    with patch.object(guardrail, "_get_session_iterator", mock_iterator):
+        masked_text = await guardrail.anonymize_text(
+            text=original_text,
+            analyze_results=analyze_results,
+            output_parse_pii=True,
+            masked_entity_count={},
+            request_data=request_data,
+        )
+
+    unmasked = _OPTIONAL_PresidioPIIMasking._unmask_pii_text(
+        masked_text, request_data["metadata"]["hidden_params"]["pii_tokens"]
+    )
+    assert unmasked == original_text
+    assert "<PERSON>" not in unmasked
+    assert "<EMAIL_ADDRESS>" not in unmasked
